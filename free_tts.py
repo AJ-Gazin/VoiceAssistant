@@ -1,3 +1,4 @@
+import json
 import torch
 import whisper
 import requests
@@ -9,48 +10,83 @@ import simpleaudio as sa
 import pyaudio
 import wave
 import Levenshtein
+import io
+import re
 
 # Configuration
 Ollama_API_URL = "http://127.0.0.1:11434/api/generate"
 START_PHRASE = "hey assistant"
 DEFAULT_DEVICE_INDEX = 1
 LEVENSHTEIN_THRESHOLD = 2  # Maximum distance to consider a match
+BUFFER_THRESHOLD = 100  # Minimum number of characters to buffer before yielding
+PUNCTUATION_REGEX = re.compile(r'[.!?]')
 
-def query_llama_model(prompt):
+
+def query_llama_model(prompt, chunk_size=1024):
     payload = {
         "model": "llama3",
         "prompt": prompt,
-        "stream": False
+        "stream": True,
+        "chunk_size": chunk_size
     }
     print(f"Sending prompt to Llama3: {prompt}")
     start_time = time.time()
-    response = requests.post(Ollama_API_URL, json=payload)
+    response = requests.post(Ollama_API_URL, json=payload, stream=True)
     response_time = time.time() - start_time
+
     if response.status_code == 200:
-        response_text = response.json().get("response", "")
-        print(f"Received response from Llama3 in {response_time:.2f} seconds: {response_text}")
-        return response_text
+        print(f"Received response from Llama3 in {response_time:.2f} seconds.")
+        buffer = ""
+        for chunk in response.iter_lines(decode_unicode=True):
+            if chunk:
+                json_data = json.loads(chunk)
+                response_text = json_data.get("response", "")
+                buffer += response_text
+                if PUNCTUATION_REGEX.search(buffer) or json_data.get("done", False):
+                    last_punctuation = max((loc for loc, val in enumerate(buffer) if PUNCTUATION_REGEX.match(val)), default=-1)
+                    if last_punctuation != -1:
+                        yield buffer[:last_punctuation + 1]
+                        buffer = buffer[last_punctuation + 1:]
+                    else:
+                        yield buffer
+                        buffer = ""
+        if buffer:
+            yield buffer
     else:
         print(f"Failed to query Llama3. Status code: {response.status_code}, Response: {response.text}")
         raise Exception("Error querying Llama model: ", response.text)
 
 def text_to_speech(text):
+    if not text.strip():
+        return None
     print(f"Converting text to speech: {text}")
     tts = gTTS(text)
-    tts.save('response.mp3')
-    if os.path.exists('response.mp3') and os.path.getsize('response.mp3') > 0:
-        print("response.mp3 generated successfully.")
-    else:
-        print("Failed to generate response.mp3.")
+    mp3_data = io.BytesIO()
+    tts.write_to_fp(mp3_data)
+    mp3_data.seek(0)
+    audio = AudioSegment.from_file(mp3_data, format="mp3")
+    return audio.raw_data
 
-def play_audio(file_path):
+def play_audio_stream(audio_generator):
     try:
-        audio = AudioSegment.from_file(file_path, format="mp3")
-        play_obj = sa.play_buffer(audio.raw_data, num_channels=audio.channels, bytes_per_sample=audio.sample_width, sample_rate=audio.frame_rate)
-        play_obj.wait_done()
+        p = pyaudio.PyAudio()
+        stream = p.open(format=pyaudio.paInt16,
+                        channels=1,
+                        rate=24000,
+                        output=True)
+
+        for chunk in audio_generator:
+            if chunk is not None:
+                stream.write(chunk)
+                #time.sleep(0.1)  # Add a small delay between audio chunks
+
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
         print("Audio playback finished.")
     except Exception as e:
-        print(f"Failed to play audio file {file_path}: {e}")
+        print(f"Failed to play audio stream: {e}")
+
 
 def record_audio(device_index, filename="temp.wav", duration=10):
     CHUNK = 1024
@@ -121,6 +157,8 @@ def detect_start_phrase_and_context():
     else:
         return None
 
+
+
 def main():
     print("Using default audio device index:", DEFAULT_DEVICE_INDEX)
 
@@ -128,17 +166,10 @@ def main():
         full_transcript = detect_start_phrase_and_context()
         if full_transcript:
             print(f"Full context: {full_transcript}")
-            response = query_llama_model(full_transcript)
-            if response:
-                print(f"Llama response: {response}")
-                text_to_speech(response)
-                if os.path.exists("response.mp3") and os.path.getsize("response.mp3") > 0:
-                    print("Playing audio response...")
-                    play_audio("response.mp3")
-                else:
-                    print("Failed to generate response.mp3 or file is empty.")
-            else:
-                print("No response from Llama3.")
+            response_generator = query_llama_model(full_transcript)
+            audio_generator = (text_to_speech(chunk) for chunk in response_generator)
+            print("Playing audio response...")
+            play_audio_stream(audio_generator)
         else:
             print("Failed to detect start phrase. Retrying...")
 
