@@ -1,0 +1,8 @@
+/.env
+/full_context.wav
+/output.mp3
+/response.mp3
+/response_chunk.mp3
+/response_chunk.wav
+/start_phrase.wav
+/voiceenv
